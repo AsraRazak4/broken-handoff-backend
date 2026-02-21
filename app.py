@@ -1,74 +1,75 @@
-# backend/app.py - COMPLETE AI Handoff Analysis API
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import pdfplumber
+from openai import OpenAI
+import os
 import re
-import random
 
 app = Flask(__name__)
-CORS(app)  # Allow Expo app requests
+CORS(app)  # Allow mobile app requests
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Your OpenAI key (get free at openai.com)
 
-# Critical anchors database (expandable)
-CRITICAL_ANCHORS = {
-    'sepsis': ['sepsis protocol', 'bp q4h', 'urine output', 'lactate', 'cultures'],
-    'cardiac': ['troponin', 'ecg', 'chest pain', 'nitroglycerin', 'heparin'],
-    'respiratory': ['oxygen sat', 'rr >30', 'bipap', 'intubate', 'vent settings'],
-    'neuro': ['gcs', 'pupils', 'seizure precautions', 'mannitol', 'ct head']
-}
-
+# Existing /api/analyze endpoint
 @app.route('/api/analyze', methods=['POST'])
 def analyze_handoff():
     data = request.json
-    anchors1 = data.get('anchors1', '').lower()
-    anchors2 = data.get('anchors2', '').lower()
+    anchors1 = data.get('anchors1', '').lower().split(',')
+    anchors2 = data.get('anchors2', '').lower().split(',')
     
-    # Extract anchors using regex
-    def extract_anchors(text):
-        anchors = []
-        # Common medical patterns
-        patterns = [
-            r'bp q?(\d+)?h?', r'sepsis.*protocol', r'urine output', r'lactate',
-            r'troponin', r'ecg', r'chest pain', r'nitro', r'o2 sat',
-            r'gcs', r'pupils??\s*equal', r'mannitol', r'ct head'
-        ]
-        for pattern in patterns:
-            if re.search(pattern, text):
-                anchors.append(re.search(pattern, text).group())
-        return anchors
+    critical = ['bp q4h', 'sepsis protocol', 'chest pain', 'urine output']
+    missing = [a for a in anchors1 if a.strip() and a.strip() not in anchors2]
     
-    nurse1_anchors = extract_anchors(anchors1)
-    nurse2_anchors = extract_anchors(anchors2)
-    
-    # Calculate match score
-    total_anchors = len(nurse1_anchors)
-    matches = len(set(nurse1_anchors) & set(nurse2_anchors))
-    risk_score = max(0, 100 - (matches / total_anchors * 70) - random.randint(5, 15))
-    
-    # AI reasoning
-    status = 'BROKEN' if risk_score > 50 else 'CLEAR'
-    missing = list(set(nurse1_anchors) - set(nurse2_anchors))
-    reasoning = f"Nurse2 missed {len(missing)} critical anchors. Risk elevated due to communication gaps."
+    risk_score = min(100, 50 + len(missing) * 20)
+    status = 'BROKEN' if risk_score > 70 else 'SAFE'
     
     return jsonify({
-        'riskScore': int(risk_score),
+        'risk_score': risk_score,
         'status': status,
-        'matches': matches,
-        'total': total_anchors,
-        'missing': missing[:3],  # Top 3 missing
-        'reasoning': reasoning,
-        'nurse1_anchors': nurse1_anchors,
-        'nurse2_anchors': nurse2_anchors
+        'missing': missing,
+        'reasoning': f"Nurse2 missed {len(missing)} critical anchors"
     })
 
-@app.route('/api/pdf-analyze', methods=['POST'])
+# ✅ NEW: Real PDF Summarizer
+@app.route('/api/pdf', methods=['POST'])
 def pdf_analyze():
-    # Simulate PDF extraction (integrate with PyPDF2 later)
-    data = request.json or {}
-    return jsonify({
-        'suffering': 'Acute sepsis with multi-organ involvement',
-        'riskScore': 82,
-        'anchors': ['BP q4h', 'Sepsis protocol', 'Urine output >30ml/hr', 'Lactate q6h', 'Cultures pending'],
-        'symptoms': 'Fever 102°F, BP 88/56, HR 118, RR 28'
-    })
+    try:
+        file = request.files['pdf']
+        text = ""
+        
+        # Extract text from PDF
+        with pdfplumber.open(file.stream) as pdf:
+            for page in pdf.pages[:3]:  # First 3 pages
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        
+        if len(text) < 100:
+            return jsonify({'error': 'No text found in PDF'})
+        
+        # AI summarize medical risks
+        response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Extract handoff risks from this medical document. 
+                Return ONLY comma-separated risks like: "BP q4h, sepsis protocol, chest pain".
+                Document: {text[:8000]}"""
+            }
+        ],
+        max_tokens=100
+    )   
+
+        risks = response.choices[0].message.content.strip().lower()
+        
+        return jsonify({
+            'risks': risks,
+            'extracted_text': text[:300] + '...' if len(text) > 300 else text,
+            'status': 'success'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
